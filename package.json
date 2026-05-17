@@ -1,6 +1,6 @@
 {
   "name": "fx-ai-groq-assistant",
-  "version": "1.3.0",
+  "version": "1.6.0",
   "description": "Secure Groq backend for DSS AI Decision Assistant",
   "main": "server.js",
   "type": "module",
