@@ -15,7 +15,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "FX AI Decision Assistant Server",
-    version: "v8-action-aware",
+    version: "v10-groq-verified",
     message: "Server is running."
   });
 });
@@ -131,7 +131,7 @@ app.post("/api/ai-decision", async (req, res) => {
       });
     }
 
-    const { concern, guides, allGuideSummaries, conversation, localAnswer } = req.body || {};
+    const { concern, guides, allGuideSummaries, conversation, localAnswerHint } = req.body || {};
 
     if (!concern || typeof concern !== "string") {
       return res.status(400).json({
@@ -139,12 +139,7 @@ app.post("/api/ai-decision", async (req, res) => {
         error: "Missing concern."
       });
     }
-
-    if (localAnswer && localAnswer.type === "recommendation" && localAnswer.action) {
-      return res.json({ ok: true, result: localAnswer });
-    }
-
-    const asksCorrCode = /\b(corr|correction)\s*code\b/i.test(concern) || /\bcorr\b/i.test(concern);
+const asksCorrCode = /\b(corr|correction)\s*code\b/i.test(concern) || /\bcorr\b/i.test(concern);
 
     const systemPrompt = `
 You are the AI Decision Assistant for an internal Decision Support System.
@@ -163,6 +158,9 @@ Rules:
 - Ask only one relevant question when required.
 - Do not ask for more detail if the node map already contains the answer.
 - If the customer asks for corr code / correction code, search ACTION values and final recommendations for the code.
+- Do NOT choose a broad code just because it shares words like "BOL", "terms", or "account".
+- If the request is ambiguous, ask the ONE missing question needed to choose the correct correction-code branch.
+- Example: "changed terms to Collect per BOL" is not automatically "attempt of payment". Ask what correction scenario applies if the node map has multiple possibilities.
 - If no corr code exists in the loaded nodes, say that clearly and suggest opening the matched guide.
 - Return valid JSON only.
 
@@ -212,6 +210,9 @@ ${buildConversationText(conversation)}
 
 ALL AVAILABLE GUIDE SUMMARIES:
 ${buildGuideSummaries(allGuideSummaries?.length ? allGuideSummaries : guides)}
+
+LOCAL BROWSER MATCH HINT:
+${localAnswerHint ? JSON.stringify(localAnswerHint) : "None. Do not rely on local shortcut."}
 
 FULL NODE MAPS SENT FOR REVIEW:
 ${buildNodeMap(guides)}
@@ -263,22 +264,7 @@ ${buildNodeMap(guides)}
         }
       });
     }
-
-    if (asksCorrCode && parsed.type === "question") {
-      return res.json({
-        ok: true,
-        result: {
-          type: "backup",
-          title: "Correction Code Not Found",
-          message: "I reviewed the loaded guide nodes but could not find a specific correction code answer.",
-          nextStep: "Open the matched Correction Code Guide or add the missing scenario detail.",
-          guideTitle: parsed.guideTitle || guides?.[0]?.guide?.title || "",
-          nodeId: parsed.nodeId || ""
-        }
-      });
-    }
-
-    return res.json({ ok: true, result: parsed });
+return res.json({ ok: true, result: parsed });
   } catch (error) {
     console.error("AI decision error:", error);
     return res.status(500).json({
@@ -289,5 +275,5 @@ ${buildNodeMap(guides)}
 });
 
 app.listen(PORT, () => {
-  console.log(`FX AI Decision Assistant Server v8 action-aware running on port ${PORT}`);
+  console.log(`FX AI Decision Assistant Server v10 groq-verified running on port ${PORT}`);
 });
