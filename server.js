@@ -9,10 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-/*
-  For first testing, this allows all origins.
-  After everything works, you can restrict this to your GitHub Pages domain.
-*/
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -38,28 +34,6 @@ function cleanText(value, maxLength = 900) {
     .slice(0, maxLength);
 }
 
-function buildGuideContext(matches = []) {
-  return matches.slice(0, 3).map((item, index) => {
-    const guide = item.guide || {};
-    const node = item.node || {};
-
-    return `
-MATCH ${index + 1}
-Guide Title: ${cleanText(guide.title || node.guideTitle || "Unknown guide")}
-Guide URL: ${cleanText(guide.url || node.guideUrl || "")}
-Category: ${cleanText(guide.category || node.category || "")}
-Node ID: ${cleanText(node.nodeId || "")}
-Node Type: ${cleanText(node.type || "")}
-Node Text: ${cleanText(node.text || "", 1200)}
-Help: ${cleanText(node.help || "", 900)}
-Note: ${cleanText(node.note || "", 900)}
-Choices: ${Array.isArray(node.choices) ? node.choices.map(c => cleanText(c, 120)).join(" | ") : ""}
-Final Recommendation: ${cleanText(node.finalRecommendation || "", 1200)}
-Score: ${item.score || ""}
-    `.trim();
-  }).join("\n\n");
-}
-
 function extractJsonFromText(text) {
   const raw = String(text || "").trim();
 
@@ -73,15 +47,56 @@ function extractJsonFromText(text) {
   const lastBrace = raw.lastIndexOf("}");
 
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const possibleJson = raw.slice(firstBrace, lastBrace + 1);
     try {
-      return JSON.parse(possibleJson);
+      return JSON.parse(raw.slice(firstBrace, lastBrace + 1));
     } catch {
       return null;
     }
   }
 
   return null;
+}
+
+function buildGuideContext(matches = []) {
+  return matches.slice(0, 5).map((item, index) => {
+    const guide = item.guide || {};
+    const node = item.node || {};
+
+    return `
+MATCH ${index + 1}
+Guide Title: ${cleanText(guide.title || node.guideTitle || "Unknown guide")}
+Guide URL: ${cleanText(guide.url || node.guideUrl || "")}
+Category: ${cleanText(guide.category || node.category || "")}
+Node ID: ${cleanText(node.nodeId || "")}
+Node Type: ${cleanText(node.type || "")}
+Node Text: ${cleanText(node.text || "", 1200)}
+Help: ${cleanText(node.help || "", 800)}
+Note: ${cleanText(node.note || "", 800)}
+Choices: ${Array.isArray(node.choices) ? node.choices.map(c => cleanText(c, 120)).join(" | ") : ""}
+Final Recommendation: ${cleanText(node.finalRecommendation || "", 1200)}
+Score: ${item.score || ""}
+    `.trim();
+  }).join("\n\n");
+}
+
+function buildConversationText(conversation = []) {
+  if (!Array.isArray(conversation)) return "None";
+
+  return conversation.slice(-10).map((item, index) => {
+    const question = cleanText(item.question || "", 350);
+    const answer = cleanText(item.answer || "", 350);
+    const detail = cleanText(item.detail || "", 500);
+
+    if (question || answer) {
+      return `${index + 1}. Question: ${question || "N/A"} | Answer: ${answer || "N/A"}`;
+    }
+
+    if (detail) {
+      return `${index + 1}. User detail: ${detail}`;
+    }
+
+    return "";
+  }).filter(Boolean).join("\n") || "None";
 }
 
 app.post("/api/ai-decision", async (req, res) => {
@@ -102,67 +117,72 @@ app.post("/api/ai-decision", async (req, res) => {
       });
     }
 
-    const safeMatches = Array.isArray(matches) ? matches.slice(0, 3) : [];
-    const safeConversation = Array.isArray(conversation)
-      ? conversation.slice(-8).map(item => ({
-          role: item.role === "assistant" ? "assistant" : "user",
-          content: cleanText(item.content, 700)
-        }))
-      : [];
-
+    const safeMatches = Array.isArray(matches) ? matches.slice(0, 5) : [];
     const guideContext = buildGuideContext(safeMatches);
+    const conversationText = buildConversationText(conversation);
 
     const systemPrompt = `
 You are the AI Decision Assistant for an internal Decision Support System.
 
-Your job:
-- Act like a decision-tree helper, not a search result summarizer.
+Goal:
+Ask the most relevant question needed to answer the customer's case concern, then give the final recommended action once enough information is known.
+
+Strict rules:
 - Use ONLY the provided guide/node context.
-- Do not invent policy, queue names, correction codes, fees, or steps.
-- Keep the response short and useful.
-- Use simple English.
-- If the guide context is not enough to decide, ask ONE follow-up question.
-- If the best matched node is a question or has choices, usually ask a follow-up question using those choices.
-- If the matched node is final or clearly gives an action, give the final recommendation.
-- Do not mention Groq, AI model, backend, token, prompt, or JSON.
+- Do not invent policy, queues, correction codes, fees, templates, or system steps.
+- Do NOT repeat a question that has already been answered in the conversation.
+- Read the conversation answers carefully and move forward.
+- Ask only ONE question at a time.
+- The question must be relevant to deciding the customer's concern.
+- If the matched context is already a final recommendation, give the recommendation.
+- If the user answered "Not sure", "None", "None fit", or the possible choices do not fit, use the backup plan.
+- Keep wording short and simple.
+- Return valid JSON only. Do not include markdown outside JSON.
+- Do not mention Groq, AI model, backend, prompt, JSON, or token.
 
-You MUST return valid JSON only. No markdown outside JSON.
-
-Return exactly one of these two JSON shapes:
-
-For a follow-up question:
+Use this JSON shape when you need one more detail:
 {
   "type": "question",
   "title": "Need one detail",
-  "message": "Ask one short question here.",
+  "message": "Ask one short relevant question.",
   "choices": ["Choice 1", "Choice 2", "Not sure"],
   "guideTitle": "Matched guide title",
-  "nodeId": "matched_node_id"
+  "nodeId": "matched node id"
 }
 
-For a recommendation:
+Use this JSON shape when you can answer:
 {
   "type": "recommendation",
   "title": "Recommended Action",
   "action": "The direct action the user should take.",
-  "reason": "Short reason using the guide context.",
+  "reason": "Short reason using the guide context and answers.",
   "nextStep": "One short next step.",
   "guideTitle": "Matched guide title",
-  "nodeId": "matched_node_id"
+  "nodeId": "matched node id"
 }
 
-Important:
-- If asking a question, choices should be short button labels.
-- If recommending, do not include long explanations.
-- If unsure, ask a question instead of guessing.
+Use this JSON shape if none of the available guide choices fit:
+{
+  "type": "backup",
+  "title": "Backup Plan",
+  "message": "Explain briefly that the listed options do not clearly fit and ask the user for one missing detail in their own words.",
+  "nextStep": "Suggest checking the matched guide or browsing guides if the concern is outside the decision flow.",
+  "guideTitle": "Matched guide title",
+  "nodeId": "matched node id"
+}
+
+Choice button rules:
+- Give 2 to 4 short choices when possible.
+- Include "Not sure" only when it is useful.
+- Do not include more than 5 choices.
     `.trim();
 
     const userPrompt = `
-Case concern:
-${cleanText(concern, 1500)}
+Customer / case concern:
+${cleanText(concern, 1600)}
 
-Conversation so far:
-${safeConversation.map(m => `${m.role}: ${m.content}`).join("\n") || "None"}
+Conversation answers already provided:
+${conversationText}
 
 Top matched guide/node context:
 ${guideContext || "No guide/node matches were provided."}
@@ -176,18 +196,12 @@ ${guideContext || "No guide/node matches were provided."}
       },
       body: JSON.stringify({
         model: "llama-3.1-8b-instant",
-        temperature: 0.15,
-        max_tokens: 550,
+        temperature: 0.12,
+        max_tokens: 520,
         response_format: { type: "json_object" },
         messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: userPrompt
-          }
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
         ]
       })
     });
@@ -207,16 +221,19 @@ ${guideContext || "No guide/node matches were provided."}
     const parsed = extractJsonFromText(content);
 
     if (!parsed || !parsed.type) {
+      const first = safeMatches[0] || {};
+      const node = first.node || {};
+      const guide = first.guide || {};
+
       return res.json({
         ok: true,
         result: {
-          type: "recommendation",
-          title: "Recommended Action",
-          action: cleanText(content || "Review the matched guide before proceeding.", 700),
-          reason: "The assistant could not format the response perfectly, but it used the matched guide context.",
-          nextStep: "Open the matched guide to confirm.",
-          guideTitle: safeMatches?.[0]?.guide?.title || "",
-          nodeId: safeMatches?.[0]?.node?.nodeId || ""
+          type: "backup",
+          title: "Backup Plan",
+          message: "I found a possible match, but I need one clearer detail before deciding.",
+          nextStep: "Add the customer concern in your own words or open the matched guide to verify.",
+          guideTitle: guide.title || node.guideTitle || "",
+          nodeId: node.nodeId || ""
         }
       });
     }
