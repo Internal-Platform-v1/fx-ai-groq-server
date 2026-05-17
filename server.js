@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "3mb" }));
 
 app.get("/", (req, res) => {
   res.json({
@@ -27,7 +27,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-function cleanText(value, maxLength = 900) {
+function cleanText(value, maxLength = 1200) {
   return String(value || "")
     .replace(/\s+/g, " ")
     .trim()
@@ -57,46 +57,57 @@ function extractJsonFromText(text) {
   return null;
 }
 
-function buildGuideContext(matches = []) {
-  return matches.slice(0, 5).map((item, index) => {
-    const guide = item.guide || {};
-    const node = item.node || {};
-
-    return `
-MATCH ${index + 1}
-Guide Title: ${cleanText(guide.title || node.guideTitle || "Unknown guide")}
-Guide URL: ${cleanText(guide.url || node.guideUrl || "")}
-Category: ${cleanText(guide.category || node.category || "")}
-Node ID: ${cleanText(node.nodeId || "")}
-Node Type: ${cleanText(node.type || "")}
-Node Text: ${cleanText(node.text || "", 1200)}
-Help: ${cleanText(node.help || "", 800)}
-Note: ${cleanText(node.note || "", 800)}
-Choices: ${Array.isArray(node.choices) ? node.choices.map(c => cleanText(c, 120)).join(" | ") : ""}
-Final Recommendation: ${cleanText(node.finalRecommendation || "", 1200)}
-Score: ${item.score || ""}
-    `.trim();
-  }).join("\n\n");
-}
-
 function buildConversationText(conversation = []) {
   if (!Array.isArray(conversation)) return "None";
 
-  return conversation.slice(-10).map((item, index) => {
-    const question = cleanText(item.question || "", 350);
-    const answer = cleanText(item.answer || "", 350);
-    const detail = cleanText(item.detail || "", 500);
-
-    if (question || answer) {
-      return `${index + 1}. Question: ${question || "N/A"} | Answer: ${answer || "N/A"}`;
-    }
-
-    if (detail) {
-      return `${index + 1}. User detail: ${detail}`;
-    }
-
-    return "";
+  return conversation.slice(-12).map((item, index) => {
+    const role = cleanText(item.role || "user", 40);
+    const content = cleanText(item.content || "", 800);
+    return content ? `${index + 1}. ${role}: ${content}` : "";
   }).filter(Boolean).join("\n") || "None";
+}
+
+function buildGuideNodeContext(guides = []) {
+  if (!Array.isArray(guides)) return "No guide node maps were provided.";
+
+  return guides.slice(0, 3).map((guideItem, guideIndex) => {
+    const guide = guideItem.guide || {};
+    const nodes = Array.isArray(guideItem.nodes) ? guideItem.nodes.slice(0, 120) : [];
+
+    const nodeLines = nodes.map((node, nodeIndex) => {
+      const choices = Array.isArray(node.choicesDetailed)
+        ? node.choicesDetailed.map(choice => {
+            const label = cleanText(choice.label, 120);
+            const next = cleanText(choice.next, 120);
+            const desc = cleanText(choice.desc, 160);
+            return `${label}${next ? ` -> ${next}` : ""}${desc ? ` (${desc})` : ""}`;
+          }).join(" | ")
+        : "";
+
+      return `
+NODE ${nodeIndex + 1}
+ID: ${cleanText(node.nodeId, 120)}
+Type: ${cleanText(node.type, 40)}
+Question/Action: ${cleanText(node.text, 1000)}
+Help: ${cleanText(node.help, 650)}
+Note: ${cleanText(node.note, 650)}
+Choices: ${choices}
+Final Recommendation: ${cleanText(node.finalRecommendation, 900)}
+      `.trim();
+    }).join("\n\n");
+
+    return `
+GUIDE ${guideIndex + 1}
+Guide ID: ${cleanText(guide.id, 120)}
+Guide Title: ${cleanText(guide.title, 200)}
+Guide URL: ${cleanText(guide.url, 250)}
+Category: ${cleanText(guide.category, 120)}
+Description: ${cleanText(guide.description, 500)}
+
+FULL NODE MAP:
+${nodeLines || "No nodes were provided for this guide."}
+    `.trim();
+  }).join("\n\n==============================\n\n");
 }
 
 app.post("/api/ai-decision", async (req, res) => {
@@ -108,7 +119,7 @@ app.post("/api/ai-decision", async (req, res) => {
       });
     }
 
-    const { concern, matches, conversation } = req.body || {};
+    const { concern, guides, conversation } = req.body || {};
 
     if (!concern || typeof concern !== "string") {
       return res.status(400).json({
@@ -117,75 +128,79 @@ app.post("/api/ai-decision", async (req, res) => {
       });
     }
 
-    const safeMatches = Array.isArray(matches) ? matches.slice(0, 5) : [];
-    const guideContext = buildGuideContext(safeMatches);
+    const guideContext = buildGuideNodeContext(guides);
     const conversationText = buildConversationText(conversation);
 
     const systemPrompt = `
 You are the AI Decision Assistant for an internal Decision Support System.
 
-Goal:
-Ask the most relevant question needed to answer the customer's case concern, then give the final recommended action once enough information is known.
+You will receive:
+1. The customer's case concern.
+2. The user's previous answers/details.
+3. The FULL NODE MAP from the most relevant guide(s).
 
-Strict rules:
-- Use ONLY the provided guide/node context.
-- Do not invent policy, queues, correction codes, fees, templates, or system steps.
-- Do NOT repeat a question that has already been answered in the conversation.
-- Read the conversation answers carefully and move forward.
-- Ask only ONE question at a time.
-- The question must be relevant to deciding the customer's concern.
-- If the matched context is already a final recommendation, give the recommendation.
-- If the user answered "Not sure", "None", "None fit", or the possible choices do not fit, use the backup plan.
-- Keep wording short and simple.
-- Return valid JSON only. Do not include markdown outside JSON.
-- Do not mention Groq, AI model, backend, prompt, JSON, or token.
+Your job:
+- Review the full node map, not just one node.
+- Ask the next most relevant question needed to answer the customer's concern.
+- Do not ask questions that were already answered.
+- Once enough information is known, provide the final recommended action from the node map.
+- If the available choices do not fit, provide a backup plan.
+- Use ONLY the provided node map. Do not invent policy, queue names, correction codes, fees, templates, or system steps.
+- Keep the answer short and practical.
+- Return valid JSON only. No markdown outside JSON.
+- Do not mention Groq, model, backend, prompt, JSON, or tokens.
 
-Use this JSON shape when you need one more detail:
+Important decision behavior:
+- Use the customer's concern to choose the most relevant guide and path.
+- If a node is a question, ask that question only when its answer is truly needed.
+- If prior answers already identify the path, move forward and give the next needed question or final action.
+- If the concern already maps to a final node, give the recommendation directly.
+- Do not repeat the same question after it was answered.
+- If the user says "none", "not sure", "none of these", or all listed options fail, use backup.
+
+Return one of these JSON shapes:
+
+QUESTION:
 {
   "type": "question",
   "title": "Need one detail",
   "message": "Ask one short relevant question.",
   "choices": ["Choice 1", "Choice 2", "Not sure"],
   "guideTitle": "Matched guide title",
-  "nodeId": "matched node id"
+  "nodeId": "node id if known"
 }
 
-Use this JSON shape when you can answer:
+RECOMMENDATION:
 {
   "type": "recommendation",
   "title": "Recommended Action",
-  "action": "The direct action the user should take.",
-  "reason": "Short reason using the guide context and answers.",
+  "action": "Direct action based on the guide node map.",
+  "reason": "Short reason using the concern and answers.",
   "nextStep": "One short next step.",
   "guideTitle": "Matched guide title",
-  "nodeId": "matched node id"
+  "nodeId": "final node id if known"
 }
 
-Use this JSON shape if none of the available guide choices fit:
+BACKUP:
 {
   "type": "backup",
   "title": "Backup Plan",
-  "message": "Explain briefly that the listed options do not clearly fit and ask the user for one missing detail in their own words.",
-  "nextStep": "Suggest checking the matched guide or browsing guides if the concern is outside the decision flow.",
-  "guideTitle": "Matched guide title",
-  "nodeId": "matched node id"
+  "message": "Briefly say the listed guide options do not clearly fit.",
+  "nextStep": "Ask the user for one missing detail in their own words or suggest opening the matched guide.",
+  "guideTitle": "Matched guide title if known",
+  "nodeId": "node id if known"
 }
-
-Choice button rules:
-- Give 2 to 4 short choices when possible.
-- Include "Not sure" only when it is useful.
-- Do not include more than 5 choices.
     `.trim();
 
     const userPrompt = `
-Customer / case concern:
-${cleanText(concern, 1600)}
+CUSTOMER / CASE CONCERN:
+${cleanText(concern, 1800)}
 
-Conversation answers already provided:
+PREVIOUS USER ANSWERS / DETAILS:
 ${conversationText}
 
-Top matched guide/node context:
-${guideContext || "No guide/node matches were provided."}
+FULL GUIDE NODE MAP CONTEXT:
+${guideContext}
     `.trim();
 
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -196,8 +211,8 @@ ${guideContext || "No guide/node matches were provided."}
       },
       body: JSON.stringify({
         model: "llama-3.1-8b-instant",
-        temperature: 0.12,
-        max_tokens: 520,
+        temperature: 0.1,
+        max_tokens: 650,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: systemPrompt },
@@ -221,19 +236,15 @@ ${guideContext || "No guide/node matches were provided."}
     const parsed = extractJsonFromText(content);
 
     if (!parsed || !parsed.type) {
-      const first = safeMatches[0] || {};
-      const node = first.node || {};
-      const guide = first.guide || {};
-
       return res.json({
         ok: true,
         result: {
           type: "backup",
           title: "Backup Plan",
-          message: "I found a possible match, but I need one clearer detail before deciding.",
-          nextStep: "Add the customer concern in your own words or open the matched guide to verify.",
-          guideTitle: guide.title || node.guideTitle || "",
-          nodeId: node.nodeId || ""
+          message: "I reviewed the guide nodes, but I need one clearer detail before deciding.",
+          nextStep: "Add what the customer is asking, what the document shows, or what system detail you checked.",
+          guideTitle: guides?.[0]?.guide?.title || "",
+          nodeId: ""
         }
       });
     }
