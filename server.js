@@ -13,23 +13,19 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ ok: true, message: 'FX AI Groq Server is running' });
 });
 
-// Main AI decision endpoint
 app.post('/api/ai-decision', async (req, res) => {
   try {
     const { concern, guides, conversation } = req.body;
 
-    // Find the correction code guide (or use the first one)
     const targetGuide = guides?.find(g => g.guide?.id === 'correction_code_guide') || guides?.[0];
     if (!targetGuide || !targetGuide.nodes) {
       return res.status(400).json({ ok: false, error: 'No valid guide nodes provided.' });
     }
 
-    // Convert the nodes object into a readable text representation for the AI
     const nodesText = JSON.stringify(targetGuide.nodes, null, 2);
 
     const systemPrompt = `You are an AI assistant for FedEx freight billing correction codes. You have access to a decision tree that defines correction codes based on a series of questions and answers.
@@ -63,7 +59,7 @@ Your task:
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
       ],
-      model: "llama-3.3-70b-versatile",  // or "mixtral-8x7b-32768"
+      model: "llama3-70b-8192",  // stable model that works with Groq
       temperature: 0.2,
       response_format: { type: "json_object" },
     });
@@ -72,7 +68,6 @@ Your task:
     if (!aiResponse) throw new Error("No response from Groq");
 
     const result = JSON.parse(aiResponse);
-    // Attach guide info for the frontend
     result.guideTitle = targetGuide.guide?.title || "Correction Code Guide";
     result.guideUrl = targetGuide.guide?.url || "#";
 
