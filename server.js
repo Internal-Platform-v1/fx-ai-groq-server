@@ -1,279 +1,89 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
+import express from 'express';
+import Groq from 'groq-sdk';
+import cors from 'cors';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: '10mb' }));
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "FX AI Decision Assistant Server",
-    version: "v10-groq-verified",
-    message: "Server is running."
-  });
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasGroqKey: Boolean(GROQ_API_KEY)
-  });
+// Health check
+app.get('/', (req, res) => {
+  res.json({ ok: true, message: 'FX AI Groq Server is running' });
 });
 
-function cleanText(value, maxLength = 1400) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-function extractJsonFromText(text) {
-  const raw = String(text || "").trim();
-
+// Main AI decision endpoint
+app.post('/api/ai-decision', async (req, res) => {
   try {
-    return JSON.parse(raw);
-  } catch {
-    // Try recovery below.
-  }
+    const { concern, guides, conversation } = req.body;
 
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-
-  if (first !== -1 && last !== -1 && last > first) {
-    try {
-      return JSON.parse(raw.slice(first, last + 1));
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
-}
-
-function buildGuideSummaries(items = []) {
-  if (!Array.isArray(items)) return "None";
-
-  return items.map((item, index) => {
-    const guide = item.guide || {};
-    return `${index + 1}. ${cleanText(guide.title, 160)} | ${cleanText(guide.category, 80)} | ${cleanText(guide.description, 260)}`;
-  }).join("\n") || "None";
-}
-
-function buildConversationText(conversation = []) {
-  if (!Array.isArray(conversation)) return "None";
-
-  return conversation.slice(-10).map((item, index) => {
-    const role = cleanText(item.role || "user", 40);
-    const content = cleanText(item.content || "", 850);
-    return content ? `${index + 1}. ${role}: ${content}` : "";
-  }).filter(Boolean).join("\n") || "None";
-}
-
-function buildNodeMap(guides = []) {
-  if (!Array.isArray(guides)) return "No guide node maps were provided.";
-
-  return guides.slice(0, 8).map((guideItem, guideIndex) => {
-    const guide = guideItem.guide || {};
-    const nodes = Array.isArray(guideItem.nodes) ? guideItem.nodes.slice(0, 180) : [];
-
-    const nodeLines = nodes.map((node, nodeIndex) => {
-      const choices = Array.isArray(node.choicesDetailed)
-        ? node.choicesDetailed.map(choice => {
-            const label = cleanText(choice.label, 140);
-            const next = cleanText(choice.next, 140);
-            const action = cleanText(choice.action, 380);
-            const desc = cleanText(choice.desc, 180);
-            const note = cleanText(choice.note, 260);
-
-            return `${label}${next ? ` -> ${next}` : ""}${action ? ` => ACTION: ${action}` : ""}${desc ? ` (${desc})` : ""}${note ? ` NOTE: ${note}` : ""}`;
-          }).join(" | ")
-        : "";
-
-      return `
-NODE ${nodeIndex + 1}
-ID: ${cleanText(node.nodeId, 140)}
-Type: ${cleanText(node.type, 50)}
-Text: ${cleanText(node.text, 1400)}
-Help: ${cleanText(node.help, 800)}
-Note: ${cleanText(node.note, 800)}
-Choices: ${choices}
-Final Recommendation: ${cleanText(node.finalRecommendation, 1400)}
-      `.trim();
-    }).join("\n\n");
-
-    return `
-GUIDE ${guideIndex + 1}
-Guide ID: ${cleanText(guide.id, 140)}
-Guide Title: ${cleanText(guide.title, 240)}
-Guide URL: ${cleanText(guide.url, 280)}
-Category: ${cleanText(guide.category, 140)}
-Description: ${cleanText(guide.description, 700)}
-
-FULL NODE MAP:
-${nodeLines || "No nodes were provided for this guide."}
-    `.trim();
-  }).join("\n\n==============================\n\n");
-}
-
-app.post("/api/ai-decision", async (req, res) => {
-  try {
-    if (!GROQ_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing GROQ_API_KEY environment variable."
-      });
+    // Find the correction code guide (or use the first one)
+    const targetGuide = guides?.find(g => g.guide?.id === 'correction_code_guide') || guides?.[0];
+    if (!targetGuide || !targetGuide.nodes) {
+      return res.status(400).json({ ok: false, error: 'No valid guide nodes provided.' });
     }
 
-    const { concern, guides, allGuideSummaries, conversation, localAnswerHint } = req.body || {};
+    // Convert the nodes object into a readable text representation for the AI
+    const nodesText = JSON.stringify(targetGuide.nodes, null, 2);
 
-    if (!concern || typeof concern !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing concern."
-      });
-    }
-const asksCorrCode = /\b(corr|correction)\s*code\b/i.test(concern) || /\bcorr\b/i.test(concern);
+    const systemPrompt = `You are an AI assistant for FedEx freight billing correction codes. You have access to a decision tree that defines correction codes based on a series of questions and answers.
 
-    const systemPrompt = `
-You are the AI Decision Assistant for an internal Decision Support System.
+Here is the decision tree (as JSON). Each node has a "text" (the question), "choices" (possible answers), and sometimes an "action" (the final correction code).
 
-You receive:
-1. The customer/case concern.
-2. Previous user details.
-3. All available guide summaries.
-4. Full node maps from the most relevant guides.
+${nodesText}
 
-Rules:
-- Review the FULL NODE MAPS before deciding.
-- Use ONLY the supplied guide/node text.
-- Many guide answers are stored as choice.action. Treat ACTION inside a choice as a valid final recommendation.
-- Do not invent policy, queue names, correction codes, fees, templates, or steps.
-- Ask only one relevant question when required.
-- Do not ask for more detail if the node map already contains the answer.
-- If the customer asks for corr code / correction code, search ACTION values and final recommendations for the code.
-- Do NOT choose a broad code just because it shares words like "BOL", "terms", or "account".
-- If the request is ambiguous, ask the ONE missing question needed to choose the correct correction-code branch.
-- Example: "changed terms to Collect per BOL" is not automatically "attempt of payment". Ask what correction scenario applies if the node map has multiple possibilities.
-- If no corr code exists in the loaded nodes, say that clearly and suggest opening the matched guide.
-- Return valid JSON only.
+Your task:
+- Read the user's concern (plain English).
+- Navigate the decision tree logically based on the user's description.
+- If the description clearly matches a path that leads to an "action", return a "recommendation" with that action (the correction code), a short reason, and a next step.
+- If the description is missing information, return a "question" with the next logical question from the tree and provide the possible choices as an array.
+- Do not invent codes that are not present in the tree.
+- Return valid JSON only, with the following structure:
 
-JSON shapes:
-
-QUESTION:
 {
-  "type": "question",
-  "title": "Need one detail",
-  "message": "Ask one short relevant question.",
-  "choices": ["Choice 1", "Choice 2", "Not sure"],
-  "guideTitle": "Matched guide title",
-  "nodeId": "node id if known"
-}
+  "type": "recommendation" | "question",
+  "title": "short title",
+  "action": "the correction code (for recommendation)",
+  "message": "explanation or question text",
+  "reason": "why this code applies",
+  "nextStep": "what to do next",
+  "choices": ["choice1", "choice2"] // only for question
+}`;
 
-RECOMMENDATION:
-{
-  "type": "recommendation",
-  "title": "Recommended Action",
-  "action": "Direct action based on the guide node map.",
-  "reason": "Short reason using guide context.",
-  "nextStep": "One short next step.",
-  "guideTitle": "Matched guide title",
-  "nodeId": "node id if known"
-}
+    const userMessage = `User concern: "${concern}"\nConversation history: ${JSON.stringify(conversation || [])}`;
 
-BACKUP:
-{
-  "type": "backup",
-  "title": "Backup Plan",
-  "message": "Briefly say why the loaded guide nodes are not enough.",
-  "nextStep": "Suggest the best manual fallback.",
-  "guideTitle": "Matched guide title if known",
-  "nodeId": "node id if known"
-}
-    `.trim();
-
-    const userPrompt = `
-CUSTOMER / CASE CONCERN:
-${cleanText(concern, 2000)}
-
-CORRECTION CODE REQUEST:
-${asksCorrCode ? "YES - do not ask general clarification; answer from ACTION/final node if available." : "NO"}
-
-PREVIOUS USER DETAILS:
-${buildConversationText(conversation)}
-
-ALL AVAILABLE GUIDE SUMMARIES:
-${buildGuideSummaries(allGuideSummaries?.length ? allGuideSummaries : guides)}
-
-LOCAL BROWSER MATCH HINT:
-${localAnswerHint ? JSON.stringify(localAnswerHint) : "None. Do not rely on local shortcut."}
-
-FULL NODE MAPS SENT FOR REVIEW:
-${buildNodeMap(guides)}
-    `.trim();
-
-    const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "llama-3.1-8b-instant",
-        temperature: 0.05,
-        max_tokens: 850,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ]
-      })
+    const completion = await groq.chat.completions.create({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+      model: "llama-3.3-70b-versatile",  // or "mixtral-8x7b-32768"
+      temperature: 0.2,
+      response_format: { type: "json_object" },
     });
 
-    if (!groqResponse.ok) {
-      const errorText = await groqResponse.text();
-      return res.status(groqResponse.status).json({
-        ok: false,
-        error: "Groq request failed.",
-        details: errorText
-      });
-    }
+    const aiResponse = completion.choices[0]?.message?.content;
+    if (!aiResponse) throw new Error("No response from Groq");
 
-    const data = await groqResponse.json();
-    const content = data?.choices?.[0]?.message?.content || "";
-    const parsed = extractJsonFromText(content);
+    const result = JSON.parse(aiResponse);
+    // Attach guide info for the frontend
+    result.guideTitle = targetGuide.guide?.title || "Correction Code Guide";
+    result.guideUrl = targetGuide.guide?.url || "#";
 
-    if (!parsed || !parsed.type) {
-      return res.json({
-        ok: true,
-        result: {
-          type: "backup",
-          title: "Backup Plan",
-          message: asksCorrCode
-            ? "I reviewed the loaded guide nodes but could not find a specific correction code answer."
-            : "I reviewed the loaded guide nodes but could not find enough information to answer.",
-          nextStep: "Open the matched guide or add the missing detail.",
-          guideTitle: guides?.[0]?.guide?.title || "",
-          nodeId: ""
-        }
-      });
-    }
-return res.json({ ok: true, result: parsed });
+    res.json({ ok: true, result });
   } catch (error) {
-    console.error("AI decision error:", error);
-    return res.status(500).json({
-      ok: false,
-      error: "Server error while generating AI decision."
-    });
+    console.error("Groq API error:", error);
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`FX AI Decision Assistant Server v10 groq-verified running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
