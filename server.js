@@ -59,7 +59,7 @@ Your task:
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
       ],
-      model: "llama3-70b-8192",  // stable model that works with Groq
+      model: "llama-3.3-70b-versatile",  // ✅ updated to a supported model
       temperature: 0.2,
       response_format: { type: "json_object" },
     });
